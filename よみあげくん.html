@@ -135,7 +135,15 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
   function loadVoices(){
     voices=synth.getVoices();
-    if(!voices.length) return;
+    if(!voices.length){
+      if(!langSel.options.length){
+        [['ja-JP','日本語'],['en-US','英語（米国）'],['en-GB','英語（英国）'],['zh-CN','中国語'],['ko-KR','韓国語'],['fr-FR','フランス語'],['de-DE','ドイツ語'],['es-ES','スペイン語'],['it-IT','イタリア語']].forEach(function(a){
+          var o=document.createElement('option'); o.value=a[0]; o.textContent=a[1]+'（'+a[0]+'）'; langSel.appendChild(o);
+        });
+        fillVoices();
+      }
+      return;
+    }
     var prev=langSel.value;
     var langs=[]; voices.forEach(function(v){if(langs.indexOf(v.lang)<0) langs.push(v.lang)});
     langs.sort(function(a,b){
@@ -158,11 +166,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
       if(f.length) list=f; else note='この言語には'+(g==='female'?'女性':'男性')+'と判定できる音声がないため、すべて表示しています。声の高さで調整してください。';
     }
     voiceSel.innerHTML='';
+    var auto=document.createElement('option'); auto.value=''; auto.textContent='自動（ブラウザの標準音声）'; voiceSel.appendChild(auto);
+    var matched=(g!=='any'&&!note);
     list.forEach(function(v){
       var o=document.createElement('option'); o.value=v.name+'||'+v.lang;
       var gl=genderOf(v); o.textContent=v.name+(gl==='female'?'（女性）':gl==='male'?'（男性）':'');
       voiceSel.appendChild(o);
     });
+    if(matched&&list.length) voiceSel.selectedIndex=1;
     if(note) setStatus(note);
   }
 
@@ -174,7 +185,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
   loadVoices();
   if(synth.onvoiceschanged!==undefined) synth.onvoiceschanged=loadVoices;
-  setTimeout(loadVoices,500);
+  var tries=0, poll=setInterval(function(){loadVoices(); if(voices.length||++tries>20) clearInterval(poll)},300);
 
   langSel.addEventListener('change',fillVoices);
   genderSel.addEventListener('change',fillVoices);
@@ -206,24 +217,44 @@ button:disabled{opacity:.4;cursor:not-allowed}
   function speak(){
     var s=text.value.trim();
     if(!s){setStatus('テキストを入力してください。',true);text.focus();return}
-    synth.cancel();
-    var id=++queueId, chunks=split(s), i=0, v=currentVoice();
-    setPlaying(true); prog.style.width='0';
-    function next(){
+    var id=++queueId, chunks=split(s), i=0, v=currentVoice(), busy=synth.speaking||synth.pending;
+    synth.cancel(); try{synth.resume()}catch(e){}
+    setPlaying(true); prog.style.width='0'; setStatus('準備中…');
+
+    function fail(msg){queueId++;synth.cancel();setPlaying(false);setStatus(msg,true)}
+
+    function playChunk(useVoice){
       if(id!==queueId) return;
       if(i>=chunks.length){setPlaying(false);prog.style.width='100%';setStatus('読み上げが終わりました。');return}
-      var u=new SpeechSynthesisUtterance(chunks[i]);
-      if(v){u.voice=v;u.lang=v.lang}else{u.lang=langSel.value||'ja-JP'}
+      var done=false, timer=null, u=new SpeechSynthesisUtterance(chunks[i]);
+      if(useVoice&&v){u.voice=v;u.lang=v.lang}else{u.lang=langSel.value||'ja-JP'}
       u.rate=Number(rate.value); u.pitch=Number(pitch.value);
-      u.onend=function(){i++;prog.style.width=Math.round(i/chunks.length*100)+'%';next()};
+      function advance(){
+        if(done) return; done=true; clearTimeout(timer);
+        if(id!==queueId) return;
+        i++; prog.style.width=Math.round(i/chunks.length*100)+'%'; playChunk(useVoice);
+      }
+      u.onstart=function(){setStatus('読み上げ中… '+(i+1)+' / '+chunks.length)};
+      u.onend=advance;
       u.onerror=function(e){
-        if(id!==queueId||e.error==='canceled'||e.error==='interrupted') return;
-        setPlaying(false); setStatus('読み上げに失敗しました（'+e.error+'）。別の音声をお試しください。',true);
+        if(done||id!==queueId) return;
+        if(e.error==='canceled'||e.error==='interrupted') return;
+        done=true; clearTimeout(timer);
+        if(e.error==='not-allowed'){fail('ブラウザが音声の再生を許可していません。もう一度ボタンを押してください。');return}
+        if(useVoice&&v){useVoice=false; setStatus('選んだ音声が使えないため、標準の音声で読み上げます。'); setTimeout(function(){playChunk(false)},50); return}
+        fail('読み上げに失敗しました（'+e.error+'）。ブラウザの音声設定を確認してください。');
       };
+      // 終了通知が来ないブラウザ向けの保険
+      timer=setTimeout(function(){
+        if(done||id!==queueId||paused) return;
+        done=true; synth.cancel(); i++;
+        setTimeout(function(){playChunk(useVoice)},60);
+      },15000+chunks[i].length*400/Number(rate.value));
       setStatus('読み上げ中… '+(i+1)+' / '+chunks.length);
       synth.speak(u);
     }
-    next();
+    // Chromeはcancel直後のspeakが無視されることがあるため少し待つ
+    if(busy) setTimeout(function(){playChunk(true)},120); else playChunk(true);
   }
 
   speakBtn.addEventListener('click',speak);
