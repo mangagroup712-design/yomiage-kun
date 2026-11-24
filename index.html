@@ -24,6 +24,7 @@
 }
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 *,*::before,*::after{box-sizing:inherit}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);
   font-family:"Hiragino Sans","Yu Gothic UI","Noto Sans JP","Meiryo",system-ui,sans-serif;line-height:1.7}
 main{max-width:720px;margin:0 auto;padding:28px 18px 48px}
@@ -41,11 +42,12 @@ select{width:100%;padding:9px 10px;font:inherit;color:var(--ink);background:var(
 .slider{display:flex;align-items:center;gap:12px}
 .slider input{flex:1;accent-color:var(--accent)}
 .slider output{min-width:3.6em;text-align:right;font-variant-numeric:tabular-nums;font-size:.9rem}
+.hint{font-size:.78rem;color:var(--muted);margin:3px 0 0}
 .buttons{display:flex;gap:10px;flex-wrap:wrap}
 button{font:inherit;font-weight:600;padding:12px 22px;border-radius:6px;border:1.5px solid var(--accent);
   background:transparent;color:var(--accent);cursor:pointer}
 button.primary{background:var(--accent);color:var(--accent-ink);flex:1 1 160px;font-size:1.05rem}
-button:disabled{opacity:.4;cursor:not-allowed}
+button:disabled,input:disabled{opacity:.4;cursor:not-allowed}
 .status{margin-top:14px;min-height:1.6em;font-size:.88rem;color:var(--muted)}
 .status.err{color:var(--warn)}
 .bar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:10px}
@@ -58,7 +60,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 <body>
 <main>
   <h1>よみあげくん</h1>
-  <p class="lead">文字を入力して「読み上げ」を押すと、音声で読んでくれます。</p>
+  <p class="lead">文字を入力して「読み上げ」を押すと、選んだ言語の音声で読んでくれます。</p>
 
   <label for="text">読み上げるテキスト</label>
   <textarea id="text" placeholder="ここに文章を入力してください（文字数の制限はありません）"></textarea>
@@ -66,7 +68,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
   <div class="grid">
     <div>
-      <label for="lang">言語</label>
+      <label for="lang">読み上げる言語</label>
       <select id="lang"></select>
     </div>
     <div>
@@ -78,7 +80,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
       </select>
     </div>
     <div class="full">
-      <label for="voice">音声</label>
+      <label for="engine">音声の取得方法</label>
+      <select id="engine">
+        <option value="auto">自動（オンライン音声を優先・失敗したら切り替え）</option>
+        <option value="se">オンライン音声（男女の声あり）</option>
+        <option value="gt">オンライン音声（Google翻訳）</option>
+        <option value="br">この端末の音声（オフライン可）</option>
+      </select>
+    </div>
+    <div class="full" id="voiceRow" hidden>
+      <label for="voice">端末の音声</label>
       <select id="voice"></select>
     </div>
     <div>
@@ -87,7 +98,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
     </div>
     <div>
       <label for="pitch">声の高さ</label>
-      <div class="slider"><input id="pitch" type="range" min="0.2" max="2" step="0.1" value="1"><output id="pitchOut">1.0</output></div>
+      <div class="slider"><input id="pitch" type="range" min="0.2" max="2" step="0.1" value="1" disabled><output id="pitchOut">1.0</output></div>
+      <p class="hint">「この端末の音声」のときだけ使えます</p>
     </div>
   </div>
 
@@ -99,25 +111,46 @@ button:disabled{opacity:.4;cursor:not-allowed}
   <div class="bar" aria-hidden="true"><i id="prog"></i></div>
   <div id="status" class="status" role="status" aria-live="polite"></div>
 
-  <p class="note">音声はお使いのブラウザ・端末に入っているものを使います。男女の区別は音声の名前から判定しているため、完全ではありません。声の高さを変えると男性寄り・女性寄りの印象を調整できます。Chromebookではネット接続が必要な「Google」の音声が多く、読み上げ開始まで数秒かかることがあります。</p>
+  <p class="note">オンライン音声はインターネット接続が必要で、入力した文章は音声を作るために外部のサービス（StreamElements、Google翻訳）へ送信されます。機密情報は入力しないでください。男女の声は言語によって用意がなく、片方だけの場合があります。</p>
 </main>
 
 <script>
 (function(){
-  var synth = window.speechSynthesis;
-  var $ = function(id){return document.getElementById(id)};
-  var text=$('text'), langSel=$('lang'), genderSel=$('gender'), voiceSel=$('voice');
-  var rate=$('rate'), pitch=$('pitch'), statusEl=$('status'), prog=$('prog');
-  var speakBtn=$('speak'), pauseBtn=$('pause'), stopBtn=$('stop');
-  var voices=[], queueId=0, paused=false;
+  var synth=window.speechSynthesis, hasBr=!!synth&&typeof SpeechSynthesisUtterance!=='undefined';
+  var $=function(id){return document.getElementById(id)};
+  var text=$('text'),langSel=$('lang'),genderSel=$('gender'),engSel=$('engine'),voiceSel=$('voice'),voiceRow=$('voiceRow');
+  var rate=$('rate'),pitch=$('pitch'),statusEl=$('status'),prog=$('prog');
+  var speakBtn=$('speak'),pauseBtn=$('pause'),stopBtn=$('stop');
+  var voices=[],queueId=0,paused=false,curAudio=null;
 
-  if(!synth || typeof SpeechSynthesisUtterance==='undefined'){
-    setStatus('このブラウザは音声読み上げに対応していません。Chrome・Edge・Safariなどでお試しください。',true);
-    speakBtn.disabled=true; return;
-  }
+  // [コード, 表示名, Google翻訳の言語コード, 女性の声, 男性の声]
+  var LANGS=[
+    ['ja-JP','日本語','ja','Mizuki','Takumi'],
+    ['en-US','英語（アメリカ）','en','Joanna','Matthew'],
+    ['en-GB','英語（イギリス）','en','Amy','Brian'],
+    ['en-AU','英語（オーストラリア）','en','Nicole','Russell'],
+    ['en-IN','英語（インド）','en','Raveena',''],
+    ['zh-CN','中国語（簡体）','zh-CN','Zhiyu',''],
+    ['zh-TW','中国語（繁体）','zh-TW','',''],
+    ['ko-KR','韓国語','ko','Seoyeon',''],
+    ['fr-FR','フランス語','fr','Celine','Mathieu'],
+    ['de-DE','ドイツ語','de','Marlene','Hans'],
+    ['es-ES','スペイン語','es','Conchita','Enrique'],
+    ['it-IT','イタリア語','it','Carla','Giorgio'],
+    ['pt-BR','ポルトガル語（ブラジル）','pt','Vitoria','Ricardo'],
+    ['ru-RU','ロシア語','ru','Tatyana','Maxim']
+  ];
+  var ENG_NAME={se:'オンライン音声',gt:'Google翻訳の音声',br:'この端末の音声'};
+
+  LANGS.forEach(function(l){var o=document.createElement('option');o.value=l[0];o.textContent=l[1];langSel.appendChild(o)});
+  if(!hasBr){for(var k=engSel.options.length-1;k>=0;k--){if(engSel.options[k].value==='br') engSel.remove(k)}}
 
   function setStatus(msg,err){statusEl.textContent=msg;statusEl.className='status'+(err?' err':'')}
+  function nl(l){return String(l||'').replace('_','-')}
+  function pre(l){return nl(l).split('-')[0].toLowerCase()}
+  function info(){return LANGS.filter(function(l){return l[0]===langSel.value})[0]||LANGS[0]}
 
+  // ---------- 端末の音声（フォールバック用） ----------
   var FEMALE=/female|kyoko|haruka|ayumi|sayaka|nanami|mizuki|o-ren|samantha|victoria|karen|moira|tessa|zira|hazel|susan|jenny|aria|michelle|ting-ting|mei-jia|sin-ji|yuna|amelie|anna|helena|paulina|monica|alice|sara|ioana|kanya|google 日本語|女/i;
   var MALE=/\bmale\b|otoya|ichiro|keita|takumi|daniel|alex\b|fred|\btom\b|david|mark\b|james|\bguy\b|eric|ryan|thomas|jorge|diego|luca|yuri|xander|男/i;
   function genderOf(v){
@@ -127,75 +160,55 @@ button:disabled{opacity:.4;cursor:not-allowed}
     if(FEMALE.test(n)) return 'female';
     return 'unknown';
   }
-
-  var dn; try{dn=new Intl.DisplayNames(['ja'],{type:'language'})}catch(e){}
-  function langLabel(code){
-    try{return (dn&&dn.of(code))||code}catch(e){return code}
+  function voicesForLang(){
+    var code=langSel.value;
+    var list=voices.filter(function(v){return nl(v.lang)===code});
+    if(!list.length) list=voices.filter(function(v){return pre(v.lang)===pre(code)});
+    return list;
   }
-
-  var DEFAULT_LANGS=['ja-JP','en-US','en-GB','en-AU','en-IN','zh-CN','zh-TW','ko-KR','fr-FR','de-DE','es-ES','it-IT','pt-BR','ru-RU'];
-  function nl(l){return String(l||'').replace('_','-')}
-  function rank(l){return /^ja/i.test(l)?0:/^en/i.test(l)?1:2}
-
-  function loadVoices(){
-    voices=synth.getVoices()||[];
-    var prevLang=langSel.value, prevVoice=voiceSel.value;
-    var langs=DEFAULT_LANGS.slice();
-    voices.forEach(function(v){var l=nl(v.lang); if(l&&langs.indexOf(l)<0) langs.push(l)});
-    langs.sort(function(a,b){return rank(a)-rank(b)||DEFAULT_LANGS.indexOf(a)-DEFAULT_LANGS.indexOf(b)||a.localeCompare(b)});
-    langSel.innerHTML='';
-    langs.forEach(function(l){
-      var o=document.createElement('option'); o.value=l; o.textContent=langLabel(l)+'（'+l+'）'; langSel.appendChild(o);
-    });
-    var want=prevLang||nl(navigator.language)||'ja-JP';
-    if(langs.indexOf(want)<0){
-      var pre=want.split('-')[0].toLowerCase();
-      want=langs.filter(function(l){return l.toLowerCase().indexOf(pre)===0})[0]||'ja-JP';
-    }
-    langSel.value=want;
-    fillVoices();
-    if(prevVoice){for(var i=0;i<voiceSel.options.length;i++){if(voiceSel.options[i].value===prevVoice){voiceSel.selectedIndex=i;break}}}
-  }
-
   function fillVoices(){
-    var cur=langSel.value, pre=cur.split('-')[0].toLowerCase();
-    var list=voices.filter(function(v){return nl(v.lang)===cur});
-    if(!list.length) list=voices.filter(function(v){return nl(v.lang).split('-')[0].toLowerCase()===pre});
-    var g=genderSel.value, note='';
-    if(g!=='any'){
-      var f=list.filter(function(v){return genderOf(v)===g});
-      if(f.length) list=f; else note='この言語には'+(g==='female'?'女性':'男性')+'と判定できる音声がないため、すべて表示しています。声の高さで調整してください。';
-    }
     voiceSel.innerHTML='';
-    var auto=document.createElement('option'); auto.value=''; auto.textContent='自動（ブラウザの標準音声）'; voiceSel.appendChild(auto);
-    var matched=(g!=='any'&&!note);
-    list.forEach(function(v){
+    var auto=document.createElement('option'); auto.value=''; auto.textContent='自動選択'; voiceSel.appendChild(auto);
+    voicesForLang().forEach(function(v){
       var o=document.createElement('option'); o.value=v.name+'||'+v.lang;
-      var gl=genderOf(v); o.textContent=v.name+(gl==='female'?'（女性）':gl==='male'?'（男性）':'');
-      voiceSel.appendChild(o);
+      var g=genderOf(v); o.textContent=v.name+(g==='female'?'（女性）':g==='male'?'（男性）':''); voiceSel.appendChild(o);
     });
-    if(matched&&list.length) voiceSel.selectedIndex=1;
-    if(note) setStatus(note);
+    if(voiceSel.options.length===1) voiceSel.options[0].textContent='この端末に'+info()[1]+'の音声がありません';
+  }
+  function pickVoice(){
+    var list=voicesForLang(); if(!list.length) return null;
+    if(engSel.value==='br'&&voiceSel.value){
+      for(var i=0;i<list.length;i++){if(list[i].name+'||'+list[i].lang===voiceSel.value) return list[i]}
+    }
+    var g=genderSel.value;
+    if(g!=='any'){var f=list.filter(function(v){return genderOf(v)===g}); if(f.length) list=f}
+    return list[0];
+  }
+  function loadVoices(){
+    if(!hasBr) return;
+    var pv=voiceSel.value; voices=synth.getVoices()||[]; fillVoices();
+    for(var i=0;i<voiceSel.options.length;i++){if(voiceSel.options[i].value===pv){voiceSel.selectedIndex=i;break}}
+  }
+  if(hasBr){
+    loadVoices();
+    if(synth.onvoiceschanged!==undefined) synth.onvoiceschanged=loadVoices;
+    var tries=0, poll0=setInterval(function(){loadVoices(); if(voices.length||++tries>20) clearInterval(poll0)},300);
   }
 
-  function currentVoice(){
-    var key=voiceSel.value; if(!key) return null;
-    for(var i=0;i<voices.length;i++){ if(voices[i].name+'||'+voices[i].lang===key) return voices[i]; }
-    return null;
+  function updateUI(){
+    var br=engSel.value==='br';
+    voiceRow.hidden=!br; pitch.disabled=!br;
   }
-
-  loadVoices();
-  if(synth.onvoiceschanged!==undefined) synth.onvoiceschanged=loadVoices;
-  var tries=0, poll=setInterval(function(){loadVoices(); if(voices.length||++tries>20) clearInterval(poll)},300);
-
   langSel.addEventListener('change',fillVoices);
   genderSel.addEventListener('change',fillVoices);
+  engSel.addEventListener('change',updateUI);
   rate.addEventListener('input',function(){$('rateOut').textContent=Number(rate.value).toFixed(1)+'倍'});
   pitch.addEventListener('input',function(){$('pitchOut').textContent=Number(pitch.value).toFixed(1)});
   text.addEventListener('input',function(){$('count').textContent=text.value.length.toLocaleString('ja-JP')+'文字'});
   text.addEventListener('keydown',function(e){if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();speak()}});
+  updateUI();
 
-  // 長文でも途切れないよう、文の区切りで分割して順番に読む
+  // ---------- 文章を短く区切る ----------
   function split(s){
     var parts=s.match(/[^。！？!?．.\n]+[。！？!?．.]*\n*|\n+/g)||[s];
     var out=[];
@@ -214,68 +227,114 @@ button:disabled{opacity:.4;cursor:not-allowed}
     pauseBtn.disabled=!on; stopBtn.disabled=!on;
     if(!on){paused=false;pauseBtn.textContent='一時停止'}
   }
+  function stopAll(){
+    queueId++;
+    if(curAudio){var a=curAudio;curAudio=null;a.onended=a.onerror=a.onplaying=null;try{a.pause()}catch(e){}}
+    if(hasBr) synth.cancel();
+  }
 
+  // ---------- 読み上げ ----------
   function speak(){
     var s=text.value.trim();
     if(!s){setStatus('テキストを入力してください。',true);text.focus();return}
-    var id=++queueId, chunks=split(s), i=0, v=currentVoice(), busy=synth.speaking||synth.pending;
-    synth.cancel(); if(synth.paused){try{synth.resume()}catch(e){}}
+    var busy=hasBr&&(synth.speaking||synth.pending);
+    stopAll();
+    if(hasBr&&synth.paused){try{synth.resume()}catch(e){}}
+    var id=queueId, chunks=split(s), i=0, L=info();
+    var order=engSel.value==='auto'?['se','gt','br']:[engSel.value];
+    if(!hasBr) order=order.filter(function(x){return x!=='br'});
+    var seName=genderSel.value==='male'?(L[4]||L[3]):(L[3]||L[4]);
+    var rt=Number(rate.value);
     paused=false; pauseBtn.textContent='一時停止';
     setPlaying(true); prog.style.width='0'; setStatus('準備中…');
 
-    function fail(msg){queueId++;synth.cancel();setPlaying(false);setStatus(msg,true)}
+    function fail(msg){stopAll();setPlaying(false);setStatus(msg,true)}
+    function next(){i++;prog.style.width=Math.round(i/chunks.length*100)+'%';playChunk()}
+    function drop(msg){
+      order.shift();
+      if(order.length) setStatus(msg+'別の方法に切り替えます…');
+      playChunk();
+    }
 
-    function playChunk(useVoice){
+    function playChunk(){
       if(id!==queueId) return;
       if(i>=chunks.length){setPlaying(false);prog.style.width='100%';setStatus('読み上げが終わりました。');return}
-      var done=false, started=false, t0=Date.now(), poll=null, u=new SpeechSynthesisUtterance(chunks[i]);
-      if(useVoice&&v){u.voice=v;u.lang=nl(v.lang)}else{u.lang=langSel.value||'ja-JP'}
-      u.rate=Number(rate.value); u.pitch=Number(pitch.value);
-      var limit=30000+chunks[i].length*500/Number(rate.value);
-
-      function stopPoll(){clearInterval(poll)}
-      function advance(){
-        if(done) return; done=true; stopPoll();
-        if(id!==queueId) return;
-        i++; prog.style.width=Math.round(i/chunks.length*100)+'%'; playChunk(useVoice);
+      if(!order.length){fail('読み上げに使える方法がありません。インターネット接続を確認するか、別の言語・取得方法をお試しください。');return}
+      var eng=order[0], txt=chunks[i];
+      if(eng==='br') return playBrowser(txt);
+      if(eng==='se'&&!seName){order.shift();return playChunk()}
+      var url= eng==='se'
+        ? 'https://api.streamelements.com/kappa/v2/speech?voice='+encodeURIComponent(seName)+'&text='+encodeURIComponent(txt)
+        : 'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl='+encodeURIComponent(L[2])+'&q='+encodeURIComponent(txt);
+      var a=new Audio(), done=false, timer=null;
+      curAudio=a; a.preload='auto'; a.src=url;
+      a.defaultPlaybackRate=rt; a.playbackRate=rt;
+      a.preservesPitch=true; a.mozPreservesPitch=true; a.webkitPreservesPitch=true;
+      function guard(ms,fn){clearTimeout(timer);timer=setTimeout(function w(){if(paused){timer=setTimeout(w,2000);return}fn()},ms)}
+      function ok(){if(done)return;done=true;clearTimeout(timer);if(id!==queueId)return;next()}
+      function bad(){
+        if(done)return;done=true;clearTimeout(timer);if(id!==queueId)return;
+        a.onended=a.onerror=a.onplaying=null;try{a.pause()}catch(e){}
+        drop(ENG_NAME[eng]+'を取得できませんでした。');
       }
-      function retryOrFail(msg){
-        done=true; stopPoll(); synth.cancel();
-        if(useVoice&&v){setStatus('選んだ音声が使えないため、標準の音声で読み上げます。'); setTimeout(function(){playChunk(false)},120)}
-        else fail(msg);
-      }
-      u.onstart=function(){started=true;setStatus('読み上げ中… '+(i+1)+' / '+chunks.length)};
-      u.onend=advance;
-      u.onerror=function(e){
+      a.onplaying=function(){setStatus('読み上げ中（'+ENG_NAME[eng]+'）… '+(i+1)+' / '+chunks.length);guard(60000,function(){try{a.pause()}catch(e){}ok()})};
+      a.onended=ok;
+      a.onerror=bad;
+      guard(12000,bad);
+      setStatus('音声を取得中（'+ENG_NAME[eng]+'）…');
+      var pr=a.play();
+      if(pr&&pr.catch) pr.catch(function(e){
         if(done||id!==queueId) return;
-        if(e.error==='canceled'||e.error==='interrupted') return;
+        if(e&&e.name==='NotAllowedError'){done=true;clearTimeout(timer);fail('ブラウザが音声の再生を許可していません。もう一度ボタンを押してください。')}
+        else bad();
+      });
+    }
+
+    function playBrowser(txt){
+      curAudio=null;
+      var v=pickVoice();
+      if(!v){drop('この端末には'+L[1]+'の音声がありません。');return}
+      var done=false,started=false,t0=Date.now(),poll=null;
+      var u=new SpeechSynthesisUtterance(txt);
+      u.voice=v; u.lang=nl(v.lang); u.rate=rt; u.pitch=Number(pitch.value);
+      function stopPoll(){clearInterval(poll)}
+      function adv(){if(done)return;done=true;stopPoll();if(id!==queueId)return;next()}
+      function bad(m){if(done)return;done=true;stopPoll();if(id!==queueId)return;synth.cancel();drop(m)}
+      u.onstart=function(){started=true;setStatus('読み上げ中（'+ENG_NAME.br+'）… '+(i+1)+' / '+chunks.length)};
+      u.onend=adv;
+      u.onerror=function(e){
+        if(done||id!==queueId||e.error==='canceled'||e.error==='interrupted') return;
         if(e.error==='not-allowed'){done=true;stopPoll();fail('ブラウザが音声の再生を許可していません。もう一度ボタンを押してください。');return}
-        retryOrFail('読み上げに失敗しました（'+e.error+'）。別の音声を選ぶか、音量・ネット接続を確認してください。');
+        bad('端末の音声で読み上げに失敗しました。');
       };
-      // onend が届かない環境（ChromebookのGoogle音声など）向けに状態を監視する
       poll=setInterval(function(){
         if(done||id!==queueId){stopPoll();return}
         if(paused){t0+=300;return}
         if(synth.speaking) started=true;
-        if(started&&!synth.speaking&&!synth.pending){advance();return}
+        if(started&&!synth.speaking&&!synth.pending){adv();return}
         var el=Date.now()-t0;
-        if(!started&&el>10000){retryOrFail('音声が再生されませんでした。音量・ミュート・ネット接続を確認し、別の音声を選んでください。');return}
-        if(el>limit){done=true;stopPoll();synth.cancel();i++;setTimeout(function(){playChunk(useVoice)},80)}
+        if(!started&&el>10000) bad('端末の音声が再生されませんでした。');
+        else if(el>30000+txt.length*500/rt){done=true;stopPoll();synth.cancel();next()}
       },300);
-      setStatus('読み上げ中… '+(i+1)+' / '+chunks.length);
+      setStatus('読み上げ中（'+ENG_NAME.br+'）… '+(i+1)+' / '+chunks.length);
       synth.speak(u);
     }
-    // Chromeはcancel直後のspeakが無視されることがあるため少し待つ
-    if(busy) setTimeout(function(){playChunk(true)},150); else playChunk(true);
+
+    if(busy) setTimeout(playChunk,150); else playChunk();
   }
 
   speakBtn.addEventListener('click',speak);
-  stopBtn.addEventListener('click',function(){queueId++;synth.cancel();setPlaying(false);prog.style.width='0';setStatus('停止しました。')});
+  stopBtn.addEventListener('click',function(){stopAll();setPlaying(false);prog.style.width='0';setStatus('停止しました。')});
   pauseBtn.addEventListener('click',function(){
-    if(!paused){synth.pause();paused=true;pauseBtn.textContent='再開';setStatus('一時停止中')}
-    else{synth.resume();paused=false;pauseBtn.textContent='一時停止';setStatus('読み上げ中…')}
+    if(!paused){
+      paused=true; if(curAudio) curAudio.pause(); else if(hasBr) synth.pause();
+      pauseBtn.textContent='再開'; setStatus('一時停止中');
+    }else{
+      paused=false; if(curAudio){var p=curAudio.play(); if(p&&p.catch) p.catch(function(){})} else if(hasBr) synth.resume();
+      pauseBtn.textContent='一時停止'; setStatus('読み上げ中…');
+    }
   });
-  window.addEventListener('beforeunload',function(){synth.cancel()});
+  window.addEventListener('beforeunload',function(){stopAll()});
 })();
 </script>
 </body>
